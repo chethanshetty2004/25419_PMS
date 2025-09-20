@@ -1,0 +1,201 @@
+import psycopg2
+import streamlit as st
+import bcrypt
+from datetime import date
+
+# --- DATABASE CONNECTION ---
+@st.cache_resource
+def get_db_connection():
+    return psycopg2.connect(
+        host="localhost",
+        database="performance_mgt",
+        user="postgres",
+        password="5432"   # change this to your actual PostgreSQL password
+    )
+
+# --- TABLE CREATION ---
+def create_tables():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS teams (
+            team_id VARCHAR(255) PRIMARY KEY,
+            team_name VARCHAR(100) NOT NULL UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS users (
+            user_id VARCHAR(255) PRIMARY KEY,
+            username VARCHAR(50) NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role VARCHAR(20) NOT NULL CHECK (role IN ('employer', 'employee')),
+            team_id VARCHAR(255) REFERENCES teams(team_id)
+        );
+        CREATE TABLE IF NOT EXISTS goals (
+            goal_id VARCHAR(255) PRIMARY KEY,
+            employer_id VARCHAR(255) REFERENCES users(user_id),
+            employee_id VARCHAR(255) REFERENCES users(user_id),
+            goal_title VARCHAR(255) NOT NULL,
+            due_date DATE,
+            status VARCHAR(50) NOT NULL DEFAULT 'Not Started'
+        );
+        CREATE TABLE IF NOT EXISTS tasks (
+            task_id VARCHAR(255) PRIMARY KEY,
+            goal_id VARCHAR(255) REFERENCES goals(goal_id) ON DELETE CASCADE,
+            task_description TEXT NOT NULL,
+            status VARCHAR(50) NOT NULL DEFAULT 'To Do'
+        );
+        CREATE TABLE IF NOT EXISTS evaluations (
+            evaluation_id VARCHAR(255) PRIMARY KEY,
+            employer_id VARCHAR(255) REFERENCES users(user_id),
+            employee_id VARCHAR(255) REFERENCES users(user_id),
+            evaluation_date DATE NOT NULL,
+            rating INTEGER CHECK (rating BETWEEN 1 AND 5),
+            notes TEXT
+        );
+    """)
+    conn.commit()
+    cursor.close()
+
+
+# --- USER AUTH ---
+def register_user(user_id, username, password, role, team_id=None):
+    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO users (user_id, username, password_hash, role, team_id)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (user_id, username, hashed_password, role, team_id))
+        conn.commit()
+        return True
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        return False
+    finally:
+        cursor.close()
+
+
+def login_user(username, password):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, password_hash, role FROM users WHERE username = %s", (username,))
+    user_data = cursor.fetchone()
+    cursor.close()
+    if user_data:
+        user_id, hashed_password, role = user_data
+        if bcrypt.checkpw(password.encode('utf-8'), hashed_password.encode('utf-8')):
+            return user_id, role
+    return None, None
+
+
+# --- EMPLOYER FUNCTIONS ---
+def get_all_employees():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, username FROM users WHERE role = 'employee'")
+    employees = cursor.fetchall()
+    cursor.close()
+    return employees
+
+
+def allot_goal_to_employee(goal_id, employer_id, employee_id, title, due_date):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO goals (goal_id, employer_id, employee_id, goal_title, due_date)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (goal_id, employer_id, employee_id, title, due_date))
+    conn.commit()
+    cursor.close()
+
+
+def allot_task_to_goal(task_id, goal_id, description):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO tasks (task_id, goal_id, task_description)
+        VALUES (%s, %s, %s)
+    """, (task_id, goal_id, description))
+    conn.commit()
+    cursor.close()
+
+
+def get_employee_performance_metrics(employee_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT g.goal_title, g.due_date, g.status AS goal_status,
+               COUNT(t.task_id) AS total_tasks,
+               COUNT(CASE WHEN t.status = 'Done' THEN 1 END) AS completed_tasks
+        FROM goals g
+        LEFT JOIN tasks t ON g.goal_id = t.goal_id
+        WHERE g.employee_id = %s
+        GROUP BY g.goal_id
+        ORDER BY g.due_date
+    """, (employee_id,))
+    metrics = cursor.fetchall()
+    cursor.close()
+    return metrics
+
+
+def add_internal_evaluation(evaluation_id, employer_id, employee_id, rating, notes):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO evaluations (evaluation_id, employer_id, employee_id, evaluation_date, rating, notes)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    """, (evaluation_id, employer_id, employee_id, date.today(), rating, notes))
+    conn.commit()
+    cursor.close()
+
+
+def get_evaluations_for_employee(employee_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT evaluation_date, rating, notes
+        FROM evaluations
+        WHERE employee_id = %s
+        ORDER BY evaluation_date DESC
+    """, (employee_id,))
+    evaluations = cursor.fetchall()
+    cursor.close()
+    return evaluations
+
+
+# --- EMPLOYEE FUNCTIONS ---
+def get_my_goals(employee_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT goal_id, goal_title, due_date, status
+        FROM goals
+        WHERE employee_id = %s
+        ORDER BY due_date
+    """, (employee_id,))
+    goals = cursor.fetchall()
+    cursor.close()
+    return goals
+
+
+def get_my_tasks(employee_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT t.task_id, g.goal_title, t.task_description, t.status
+        FROM tasks t
+        JOIN goals g ON t.goal_id = g.goal_id
+        WHERE g.employee_id = %s
+        ORDER BY t.status DESC, g.due_date
+    """, (employee_id,))
+    tasks = cursor.fetchall()
+    cursor.close()
+    return tasks
+
+
+def update_task_status(task_id, new_status):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE tasks SET status = %s WHERE task_id = %s", (new_status, task_id))
+    conn.commit()
+    cursor.close()
