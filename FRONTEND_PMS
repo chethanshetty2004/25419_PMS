@@ -1,0 +1,243 @@
+import streamlit as st
+import pandas as pd
+import uuid
+import plotly.graph_objects as go
+from backend_pm import (
+    create_tables, register_user, login_user,
+    get_all_employees, allot_goal_to_employee, allot_task_to_goal,
+    get_employee_performance_metrics, add_internal_evaluation, get_evaluations_for_employee,
+    get_my_goals, get_my_tasks, update_task_status
+)
+
+# --- INITIALIZATION & SESSION STATE ---
+create_tables()
+
+if 'logged_in' not in st.session_state:
+    st.session_state['logged_in'] = False
+if 'user_id' not in st.session_state:
+    st.session_state['user_id'] = None
+if 'role' not in st.session_state:
+    st.session_state['role'] = None
+
+
+# --- LOGIN/LOGOUT LOGIC ---
+def login_page():
+    st.title("Login to Performance App")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+
+    if st.button("Login"):
+        user_id, role = login_user(username, password)
+        if user_id:
+            st.session_state['logged_in'] = True
+            st.session_state['user_id'] = user_id
+            st.session_state['role'] = role
+            st.success(f"Logged in as {role}!")
+            st.rerun()
+        else:
+            st.error("Invalid username or password.")
+
+    st.sidebar.markdown("### Register")
+    with st.sidebar.form("registration_form"):
+        reg_username = st.text_input("New Username")
+        reg_password = st.text_input("New Password", type="password")
+        reg_role = st.selectbox("Role", ["employer", "employee"])
+        if st.form_submit_button("Register"):
+            success = register_user(str(uuid.uuid4()), reg_username, reg_password, reg_role)
+            if success:
+                st.success("Registration successful! You can now log in.")
+            else:
+                st.error("Username already exists.")
+
+
+def logout():
+    st.session_state['logged_in'] = False
+    st.session_state['user_id'] = None
+    st.session_state['role'] = None
+    st.success("Logged out successfully.")
+    st.rerun()
+
+
+# --- EMPLOYER INTERFACE ---
+def employer_interface():
+    st.sidebar.button("Logout", on_click=logout)
+    st.title("👨‍💼 Employer Dashboard")
+
+    tabs = st.tabs(["📊 Team Overview", "🎯 Goal Management", "📝 Evaluations & Reports"])
+
+    # Team Overview
+    with tabs[0]:
+        st.header("Team Performance Metrics")
+        employees = get_all_employees()
+        if employees:
+            df_employees = pd.DataFrame(employees, columns=['user_id', 'username'])
+            st.write("### Your Team Members")
+            st.dataframe(df_employees)
+        else:
+            st.info("No employees registered yet.")
+
+    # Goal Management
+    with tabs[1]:
+        st.header("Manage Goals and Tasks")
+
+        # Assign a Goal
+        st.subheader("Assign a New Goal")
+        employees = get_all_employees()
+        if employees:
+            with st.form("goal_form", clear_on_submit=True):
+                employee_names = [e[1] for e in employees]
+                selected_employee_name = st.selectbox("Select Employee:", employee_names)
+                employee_id = [e[0] for e in employees if e[1] == selected_employee_name][0]
+
+                goal_title = st.text_input("Goal Title")
+                due_date = st.date_input("Due Date")
+
+                if st.form_submit_button("Allot Goal"):
+                    allot_goal_to_employee(str(uuid.uuid4()), st.session_state['user_id'], employee_id, goal_title, due_date)
+                    st.success("Goal successfully assigned!")
+                    st.rerun()
+        else:
+            st.warning("No employees to assign goals to.")
+
+        # Assign Task
+        st.subheader("Assign a Task to a Goal")
+        all_employees = get_all_employees()
+        if all_employees:
+            employee_names = [e[1] for e in all_employees]
+            selected_employee_name_tasks = st.selectbox("Select Employee:", employee_names, key='task_emp_select')
+            employee_id_tasks = [e[0] for e in all_employees if e[1] == selected_employee_name_tasks][0]
+
+            goals = get_my_goals(employee_id_tasks)
+            if goals:
+                df_goals = pd.DataFrame(goals, columns=['goal_id', 'title', 'due_date', 'status'])
+                selected_goal_title = st.selectbox("Select Goal:", df_goals['title'])
+                goal_id = df_goals[df_goals['title'] == selected_goal_title]['goal_id'].iloc[0]
+
+                with st.form("task_form", clear_on_submit=True):
+                    task_description = st.text_area("Task Description")
+                    if st.form_submit_button("Allot Task"):
+                        allot_task_to_goal(str(uuid.uuid4()), goal_id, task_description)
+                        st.success("Task assigned!")
+                        st.rerun()
+            else:
+                st.info("The selected employee has no goals.")
+        else:
+            st.warning("No employees found.")
+
+    # Evaluations & Reports
+    with tabs[2]:
+        st.header("Performance Reports")
+        employees = get_all_employees()
+        if employees:
+            employee_names = [e[1] for e in employees]
+            selected_employee_name_report = st.selectbox("Generate report for:", employee_names)
+            employee_id_report = [e[0] for e in employees if e[1] == selected_employee_name_report][0]
+
+            metrics = get_employee_performance_metrics(employee_id_report)
+            if metrics:
+                st.subheader(f"Descriptive Report for {selected_employee_name_report}")
+                df_report = pd.DataFrame(metrics, columns=['Goal Title', 'Due Date', 'Goal Status', 'Total Tasks', 'Completed Tasks'])
+                df_report['Completion Rate'] = df_report['Completed Tasks'] / df_report['Total Tasks']
+                st.dataframe(df_report)
+
+                # Visualization
+                st.subheader("Goal Completion Rate")
+                fig = go.Figure(data=go.Bar(
+                    x=df_report['Goal Title'],
+                    y=df_report['Completion Rate'],
+                    marker_color=df_report['Completion Rate'],
+                    text=df_report['Completion Rate'].apply(lambda x: f"{x:.0%}"),
+                    textposition='auto'
+                ))
+                fig.update_layout(yaxis_tickformat=".0%", title="Goal Completion Rate by Goal")
+                st.plotly_chart(fig)
+
+                # Notes
+                st.subheader("Prescriptive Notes")
+                st.text_area("Enter your notes here...")
+            else:
+                st.info("No performance data available for this employee.")
+
+            # Evaluation
+            st.subheader("Add Private Evaluation")
+            with st.form("evaluation_form"):
+                rating = st.slider("Rating (1-5)", 1, 5)
+                eval_notes = st.text_area("Internal notes (Not visible to employee)")
+                if st.form_submit_button("Submit Evaluation"):
+                    add_internal_evaluation(str(uuid.uuid4()), st.session_state['user_id'], employee_id_report, rating, eval_notes)
+                    st.success("Evaluation submitted!")
+                    st.rerun()
+
+            # Evaluation History
+            st.subheader("Evaluation History (Internal)")
+            evaluations = get_evaluations_for_employee(employee_id_report)
+            if evaluations:
+                df_evals = pd.DataFrame(evaluations, columns=['Date', 'Rating', 'Notes'])
+                st.dataframe(df_evals)
+            else:
+                st.info("No evaluations on record for this employee.")
+
+
+# --- EMPLOYEE INTERFACE ---
+def employee_interface():
+    st.sidebar.button("Logout", on_click=logout)
+    st.title("🧑‍💻 Employee Portal")
+
+    tabs = st.tabs(["📊 My Dashboard", "✅ My Tasks"])
+
+    with tabs[0]:
+        st.header("My Performance Overview")
+        goals_data = get_my_goals(st.session_state['user_id'])
+        if goals_data:
+            df_goals = pd.DataFrame(goals_data, columns=['goal_id', 'title', 'due_date', 'status'])
+            st.subheader("My Goals")
+            st.dataframe(df_goals[['title', 'due_date', 'status']])
+
+            st.subheader("Task Status Breakdown")
+            tasks_data = get_my_tasks(st.session_state['user_id'])
+            if tasks_data:
+                df_tasks = pd.DataFrame(tasks_data, columns=['task_id', 'goal_title', 'description', 'status'])
+                task_counts = df_tasks['status'].value_counts()
+                fig_tasks = go.Figure(data=[go.Pie(labels=task_counts.index, values=task_counts.values)])
+                fig_tasks.update_layout(title_text='Task Status Breakdown')
+                st.plotly_chart(fig_tasks)
+            else:
+                st.info("No tasks assigned yet.")
+        else:
+            st.info("No goals or tasks assigned to you yet.")
+
+    with tabs[1]:
+        st.header("My Assigned Tasks")
+        tasks_data = get_my_tasks(st.session_state['user_id'])
+        if tasks_data:
+            df_tasks = pd.DataFrame(tasks_data, columns=['task_id', 'goal_title', 'description', 'status'])
+            df_tasks['due_date'] = df_tasks['goal_title'].map({goal[1]: goal[2] for goal in get_my_goals(st.session_state['user_id'])})
+
+            for index, row in df_tasks.iterrows():
+                st.markdown(f"**Goal:** {row['goal_title']}")
+                st.markdown(f"**Task:** {row['description']}")
+                st.markdown(f"**Status:** {row['status']} | **Due Date:** {row['due_date']}")
+
+                new_status = st.selectbox(
+                    "Update status:",
+                    ["To Do", "In Progress", "Done"],
+                    index=["To Do", "In Progress", "Done"].index(row['status']),
+                    key=f"status_{row['task_id']}"
+                )
+                if st.button("Update", key=f"btn_{row['task_id']}"):
+                    update_task_status(row['task_id'], new_status)
+                    st.success("Task status updated!")
+                    st.rerun()
+                st.markdown("---")
+        else:
+            st.info("No tasks assigned to you.")
+
+
+# --- MAIN APP LOGIC ---
+if st.session_state['logged_in']:
+    if st.session_state['role'] == 'employer':
+        employer_interface()
+    else:
+        employee_interface()
+else:
+    login_page()
